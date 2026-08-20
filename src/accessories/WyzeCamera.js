@@ -1,508 +1,529 @@
 const { Service, Characteristic } = require("../types");
 const WyzeAccessory = require("./WyzeAccessory");
 const enums = require("../enums");
-
-const noResponse = new Error("No Response");
-noResponse.toString = () => {
-  return noResponse.message;
-};
+const WyzeCameraStreamingDelegate = require("../camera/WyzeCameraStreamingDelegate");
+const { markServiceOnline } = require("./offlineIndicator");
 
 module.exports = class WyzeCamera extends WyzeAccessory {
   constructor(plugin, homeKitAccessory) {
     super(plugin, homeKitAccessory);
 
-    if (Object.values(enums.CameraModels).includes(this.product_model)) {
-      if (this.plugin.config.pluginLoggingEnabled)
-        this.plugin.log(
-          `[Camera] [Privacy Switch] Retrieving previous service for ${this.mac} (${this.display_name})`
-        );
-      this.privacySwitch = this.homeKitAccessory.getService(this.display_name);
+    // CameraController is deferred to first updateCharacteristics so it runs
+    // after homebridge publishes the bridge (not during configureAccessory).
+    this._cameraControllerReady = false;
+    this.cameraOnline = false;
 
-      if (!this.privacySwitch) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [Privacy Switch] Adding service for ${this.mac} (${this.display_name})`
-          );
-        this.privacySwitch = this.homeKitAccessory.addService(
-          Service.Switch,
-          this.display_name,
-          "Privacy"
-        );
-      }
+    // Restore last-known characteristic values from disk so HomeKit shows
+    // the right state immediately on reboot instead of "undefined" until
+    // the first refresh cycle runs.
+    const persisted = this.loadPersistedState();
+    this.on = persisted.on;                       // privacy (PID-driven)
+    this.power_switch = persisted.power_switch;   // privacy (bulk-list)
+    this.notification = persisted.notification;
+    this.siren = persisted.siren;
+    this.floodLight = persisted.floodLight;       // shared with spotlight (P1056)
+    this.garageDoor = persisted.garageDoor;
+    this.motionDetection = persisted.motionDetection;
+
+    // Remove any MotionSensor service left over from earlier plugin versions —
+    // we don't have a reliable way to detect motion so we no longer expose it.
+    const staleMotion = this.homeKitAccessory.getService(Service.MotionSensor);
+    if (staleMotion) this.homeKitAccessory.removeService(staleMotion);
+
+    if (!Object.values(enums.CameraModels).includes(this.product_model)) return;
+
+    // Floodlight Pro does not expose a reliable privacy/power control.
+    // Do not publish the nonfunctional Privacy switch for LD_CFP.
+    if (this.product_model !== "LD_CFP") {
+      this.privacySwitch = this._getOrAddService({
+        ServiceType: Service.Switch,
+        subtype: "Privacy",
+        defaultName: `${this.display_name} Privacy`,
+        legacyLookup: () => this.homeKitAccessory.getService(this.display_name),
+        label: "Privacy Switch",
+      });
 
       this.privacySwitch
         .getCharacteristic(Characteristic.On)
         .onGet(this.handleOnGetPrivacySwitch.bind(this))
         .onSet(this.handleOnSetPrivacySwitch.bind(this));
-
-      if (this.cameraAccessoryAttached()) {
-        if (
-          this.plugin.config.garageDoorAccessory?.find((d) => d === this.mac)
-        ) {
-          this.garageDoorEnabled = true;
-          if (this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [Garage Door] Retrieving previous service for ${this.mac} (${this.display_name})`
-            );
-          this.garageDoorService = this.homeKitAccessory.getService(
-            Service.GarageDoorOpener
-          );
-          if (!this.garageDoorService) {
-            if (this.plugin.config.pluginLoggingEnabled)
-              this.plugin.log(
-                `[Camera] [Garage Door] Adding service for ${this.mac} (${this.display_name})`
-              );
-            this.garageDoorService = this.homeKitAccessory.addService(
-              Service.GarageDoorOpener
-            );
-          }
-          // create handlers for required characteristics
-          this.garageDoorService
-            .getCharacteristic(Characteristic.CurrentDoorState)
-            .onGet(this.getGarageCurrentState.bind(this));
-
-          this.garageDoorService
-            .getCharacteristic(Characteristic.TargetDoorState)
-            .onGet(this.getGarageTargetState.bind(this))
-            .onSet(this.setGarageTargetState.bind(this));
-
-          this.garageDoorService
-            .getCharacteristic(Characteristic.ObstructionDetected)
-            .onGet(this.handleObstructionDetectedGet.bind(this));
-        }
-        if (
-          this.plugin.config.spotLightAccessory?.find((d) => d === this.mac)
-        ) {
-          this.spotLightEnabled = true;
-          if (this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [Spotlight Switch] Retrieving previous service for ${this.mac} (${this.display_name})`
-            );
-
-          this.spotLightService = this.homeKitAccessory.getService(
-            Service.Lightbulb
-          );
-          if (!this.spotLightService) {
-            if (this.plugin.config.pluginLoggingEnabled)
-              this.plugin.log(
-                `[Camera] [Spotlight] Adding service for ${this.mac} (${this.display_name})`
-              );
-            this.spotLightService = this.homeKitAccessory.addService(
-              Service.Lightbulb,
-              this.display_name + " Spotlight",
-              "Spotlight"
-            );
-          }
-
-          this.spotLightService
-            .getCharacteristic(Characteristic.On)
-            .onGet(this.handleOnGetSpotlight.bind(this))
-            .onSet(this.handleOnSetSpotlight.bind(this));
-        }
-        if (
-          this.plugin.config.floodLightAccessory?.find((d) => d === this.mac)
-        ) {
-          this.floodLightEnabled = true;
-          if (this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [FloodLight] Retrieving previous service for ${this.mac} (${this.display_name})`
-            );
-
-          this.floodLightService = this.homeKitAccessory.getService(
-            Service.Lightbulb
-          );
-          if (!this.floodLightService) {
-            if (this.plugin.config.pluginLoggingEnabled)
-              this.plugin.log(
-                `[Camera] [FloodLight] Adding service for ${this.mac} (${this.display_name})`
-              );
-            this.floodLightService = this.homeKitAccessory.addService(
-              Service.Lightbulb,
-              this.display_name + " FloodLight",
-              "FloodLight"
-            );
-          }
-
-          this.floodLightService
-            .getCharacteristic(Characteristic.On)
-            .onGet(this.handleOnGetFloodlight.bind(this))
-            .onSet(this.handleOnSetFloodlight.bind(this));
-        }
-        if (this.plugin.config.sirenAccessory?.find((d) => d === this.mac)) {
-          this.sirenEnabled = true;
-          if (this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [Siren] Retrieving previous service for ${this.mac} (${this.display_name})`
-            );
-          this.sirenSwitch = this.homeKitAccessory.getService(
-            this.display_name + " Siren"
-          );
-          if (!this.sirenSwitch) {
-            if (this.plugin.config.pluginLoggingEnabled)
-              this.plugin.log(
-                `[Camera] [Alarm Switch] Adding service for ${this.mac} (${this.display_name})`
-              );
-            this.sirenSwitch = this.homeKitAccessory.addService(
-              Service.Switch,
-              this.display_name + " Siren",
-              "Siren"
-            );
-          }
-
-          this.sirenSwitch
-            .getCharacteristic(Characteristic.On)
-            .onGet(this.handleOnGetAlarmSwitch.bind(this))
-            .onSet(this.handleOnSetAlarmSwitch.bind(this));
-        }
-        if (
-          this.plugin.config.notificationAccessory?.find((d) => d === this.mac)
-        ) {
-          if (this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [Notification] Retrieving previous service for ${this.mac} (${this.display_name})`
-            );
-          this.notificationSwitch = this.homeKitAccessory.getService(
-            this.display_name + " Notification"
-          );
-          if (!this.notificationSwitch) {
-            if (this.plugin.config.pluginLoggingEnabled)
-              this.plugin.log(
-                `[Camera] [Notification] Adding service for ${this.mac} (${this.display_name})`
-              );
-            this.notificationSwitch = this.homeKitAccessory.addService(
-              Service.Switch,
-              this.display_name + " Notification",
-              "Notification"
-            );
-          }
-
-          this.notificationSwitch
-            .getCharacteristic(Characteristic.On)
-            .onGet(this.getNotification.bind(this))
-            .onSet(this.setNotification.bind(this));
-        }
-      }
     }
-  }
 
-  async updateCharacteristics(device) {
-    const wasOffline = this._lastConnState === 0;
-    this._lastConnState = device.conn_state;
-    if (device.conn_state === 0) {
-      if (!wasOffline && this.plugin.config.pluginLoggingEnabled)
-        this.plugin.log(
-          `[Camera] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-        );
-      this.privacySwitch
+    if (!this.cameraAccessoryAttached()) return;
+
+    // Optional services driven by per-MAC config arrays.
+    if (this._isInConfig("garageDoorAccessory")) {
+      this.garageDoorEnabled = true;
+      this.garageDoorService = this._getOrAddService({
+        ServiceType: Service.GarageDoorOpener,
+        subtype: "GarageDoor",
+        defaultName: `${this.display_name} Garage Door`,
+        label: "Garage Door",
+      });
+      this.garageDoorService
+        .getCharacteristic(Characteristic.CurrentDoorState)
+        .onGet(this.getGarageCurrentState.bind(this));
+      this.garageDoorService
+        .getCharacteristic(Characteristic.TargetDoorState)
+        .onGet(this.getGarageTargetState.bind(this))
+        .onSet(this.setGarageTargetState.bind(this));
+      this.garageDoorService
+        .getCharacteristic(Characteristic.ObstructionDetected)
+        .onGet(this.handleObstructionDetectedGet.bind(this));
+    }
+
+    if (this._isInConfig("spotLightAccessory")) {
+      this.spotLightEnabled = true;
+      this.spotLightService = this._getOrAddService({
+        ServiceType: Service.Lightbulb,
+        subtype: "Spotlight",
+        defaultName: `${this.display_name} Spotlight`,
+        label: "Spotlight",
+      });
+      this.spotLightService
         .getCharacteristic(Characteristic.On)
-        .updateValue(noResponse);
-      if (this.plugin.config.sirenAccessory?.find((d) => d === device.mac)) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [Siren] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-          );
-        this.sirenSwitch
-          .getCharacteristic(Characteristic.On)
-          .updateValue(noResponse);
-      }
-      if (this.plugin.config.floodLightAccessory?.find((d) => d === this.mac)) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [FloodLight] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-          );
-        this.floodLightService
-          .getCharacteristic(Characteristic.On)
-          .updateValue(noResponse);
-      }
-      if (this.plugin.config.spotLightAccessory?.find((d) => d === this.mac)) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [Spotlight] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-          );
-        this.spotLightService
-          .getCharacteristic(Characteristic.On)
-          .updateValue(noResponse);
-      }
-      if (this.plugin.config.garageDoorAccessory?.find((d) => d === this.mac)) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [Garage Door] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-          );
-        this.garageDoorService
-          .getCharacteristic(Characteristic.CurrentDoorState)
-          .updateValue(noResponse);
-      }
-      if (
-        this.plugin.config.notificationAccessory?.find((d) => d === this.mac)
-      ) {
-        if (this.plugin.config.pluginLoggingEnabled)
-          this.plugin.log(
-            `[Camera] [Notification] Updating status of "${this.display_name} (${this.mac})" to noResponse`
-          );
-        this.notificationSwitch
-          .getCharacteristic(Characteristic.On)
-          .updateValue(noResponse);
-      }
-    } else {
-      if (this.cameraAccessoryAttached()) {
-        const propertyList = await this.plugin.client.getDevicePID(
-          this.mac,
-          this.product_model
-        );
-        for (const property of propertyList?.data?.property_list ?? []) {
-          switch (property.pid) {
-            case "P1":
-              if (
-                this.plugin.config.notificationAccessory?.find(
-                  (d) => d === this.mac
-                )
-              ) {
-                if (this.notification !== property.value && this.plugin.config.pluginLoggingEnabled) {
-                  this.plugin.log(
-                    `[Camera] [Notification] Updating status of "${this.display_name} (${this.mac})"`
-                  );
-                }
-                this.notification = property.value;
-                this.notificationSwitch
-                  .getCharacteristic(Characteristic.On)
-                  .updateValue(this.notification);
-              }
-              break;
-            case "P3":
-              if (this.on !== property.value && this.plugin.config.pluginLoggingEnabled)
-                this.plugin.log(
-                  `[Camera] [Privacy] Updating status of "${this.display_name} (${this.mac})"`
-                );
-              this.on = property.value;
-              this.privacySwitch
-                .getCharacteristic(Characteristic.On)
-                .updateValue(this.on);
-              break;
-            case "P5":
-              this.available = property.value;
-              break;
-            case "P1049":
-              if (
-                this.plugin.config.sirenAccessory?.find((d) => d === this.mac)
-              ) {
-                if (this.plugin.config.pluginLoggingEnabled) {
-                  this.plugin.log(
-                    `[Camera] [Siren] Updating status of ${this.mac} (${this.display_name})`
-                  );
-                }
-                this.siren = property.value;
-                this.sirenSwitch
-                  .getCharacteristic(Characteristic.On)
-                  .updateValue(this.siren);
-              }
-              break;
-            case "P1056":
-              if (
-                this.plugin.config.spotLightAccessory?.find(
-                  (d) => d === this.mac
-                )
-              ) {
-                if (this.plugin.config.pluginLoggingEnabled) {
-                  this.plugin.log(
-                    `[Camera] [Spotlight] Updating status of ${this.mac} (${this.display_name})`
-                  );
-                }
-                this.floodLight = property.value;
-                this.spotLightService
-                  .getCharacteristic(Characteristic.On)
-                  .updateValue(this.floodLight);
-              }
-              break;
-            case "P1301":
-              if (
-                this.plugin.config.garageDoorAccessory?.find(
-                  (d) => d === this.mac
-                )
-              ) {
-                if (this.plugin.config.pluginLoggingEnabled) {
-                  this.plugin.log(
-                    `[Camera] [Garage Door] Updating status of ${this.mac} (${this.display_name})`
-                  );
-                }
-                this.garageDoor = property.value;
-              }
-              break;
-          }
-        }
-      } else {
-        const newPowerSwitch = device.device_params?.power_switch;
-        if (newPowerSwitch != null) {
-          if (this.power_switch !== newPowerSwitch && this.plugin.config.pluginLoggingEnabled)
-            this.plugin.log(
-              `[Camera] [Privacy] Updating status of "${this.display_name} (${this.mac})"`
-            );
-          this.power_switch = newPowerSwitch;
-          this.privacySwitch
-            .getCharacteristic(Characteristic.On)
-            .updateValue(newPowerSwitch);
-        }
-      }
+        .onGet(this.handleOnGetSpotlight.bind(this))
+        .onSet(this.handleOnSetSpotlight.bind(this));
+    }
+
+    if (this._isInConfig("floodLightAccessory")) {
+      this.floodLightEnabled = true;
+      this.floodLightService = this._getOrAddService({
+        ServiceType: Service.Lightbulb,
+        subtype: "FloodLight",
+        defaultName: `${this.display_name} Floodlight`,
+        label: "Floodlight",
+      });
+      this.floodLightService
+        .getCharacteristic(Characteristic.On)
+        .onGet(this.handleOnGetFloodlight.bind(this))
+        .onSet(this.handleOnSetFloodlight.bind(this));
+    }
+
+    if (this._isInConfig("sirenAccessory")) {
+      this.sirenEnabled = true;
+      this.sirenSwitch = this._getOrAddService({
+        ServiceType: Service.Switch,
+        subtype: "Siren",
+        defaultName: `${this.display_name} Siren`,
+        legacyLookup: () => this.homeKitAccessory.getService(`${this.display_name} Siren`),
+        label: "Siren",
+      });
+      this.sirenSwitch
+        .getCharacteristic(Characteristic.On)
+        .onGet(this.handleOnGetAlarmSwitch.bind(this))
+        .onSet(this.handleOnSetAlarmSwitch.bind(this));
+    }
+
+    if (this._isInConfig("notificationAccessory")) {
+      this.notificationSwitch = this._getOrAddService({
+        ServiceType: Service.Switch,
+        subtype: "Notification",
+        defaultName: `${this.display_name} Notifications`,
+        legacyLookup: () =>
+          this.homeKitAccessory.getService(`${this.display_name} Notification`),
+        label: "Notifications",
+      });
+      this.notificationSwitch
+        .getCharacteristic(Characteristic.On)
+        .onGet(this.getNotification.bind(this))
+        .onSet(this.setNotification.bind(this));
+    }
+
+    // Motion-detection master switch: toggles whether the camera even
+    // looks for motion. Different from the Notifications switch above —
+    // notifications gates the alerts you get; motion detection gates
+    // whether the camera processes motion at all (so e.g. recording
+    // triggers stop too). Useful for users who want the camera always
+    // powered on but want to pause motion-driven automation via
+    // HomeKit. Resolves #231.
+    if (this._isInConfig("motionDetectionAccessory")) {
+      this.motionDetectionSwitch = this._getOrAddService({
+        ServiceType: Service.Switch,
+        subtype: "MotionDetection",
+        defaultName: `${this.display_name} Motion Detection`,
+        legacyLookup: () =>
+          this.homeKitAccessory.getService(`${this.display_name} Motion Detection`),
+        label: "Motion Detection",
+      });
+      this.motionDetectionSwitch
+        .getCharacteristic(Characteristic.On)
+        .onGet(this.getMotionDetection.bind(this))
+        .onSet(this.setMotionDetection.bind(this));
     }
   }
 
-  async getGarageCurrentState() {
+  // ---- Helpers --------------------------------------------------------------
+
+  _isInConfig(key) {
+    const normalizeMac = (value) =>
+      String(value || "")
+        .replace(/^LD_CFP_/i, "")
+        .replace(/[^a-f0-9]/gi, "")
+        .toUpperCase();
+
+    const deviceMac = normalizeMac(this.mac);
+
+    // Legacy 1.x flat-array config.
+    if (
+      this.plugin.config[key]?.some(
+        (mac) => normalizeMac(mac) === deviceMac
+      )
+    ) {
+      return true;
+    }
+
+    // 2.x per-camera config.
+    const featureMap = {
+      garageDoorAccessory: "garage",
+      spotLightAccessory: "spotlight",
+      floodLightAccessory: "floodlight",
+      sirenAccessory: "siren",
+      notificationAccessory: "notifications",
+      motionDetectionAccessory: "motionDetection",
+    };
+
+    const feature = featureMap[key];
+    if (!feature || !Array.isArray(this.plugin.config.cameras)) {
+      return false;
+    }
+
+    const camera = this.plugin.config.cameras.find(
+      (c) => normalizeMac(c?.mac) === deviceMac
+    );
+
+    return camera?.[feature] === true;
+  }
+
+  _getOrAddService({ ServiceType, subtype, defaultName, legacyLookup, label }) {
+    // Prefer subtype-based lookup (stable across renames). Fall back to a
+    // legacy name-based lookup so cameras paired before the naming change
+    // don't accidentally grow a duplicate service.
+    let service = this.homeKitAccessory.getServiceById(ServiceType, subtype);
+    if (!service && legacyLookup) service = legacyLookup();
+    if (!service) {
+      if (this.plugin.config.pluginLoggingEnabled)
+        this.plugin.log(
+          `[Camera] [${label}] Adding service for ${this.mac} (${this.display_name})`
+        );
+      service = this.homeKitAccessory.addService(ServiceType, defaultName, subtype);
+      // Set ConfiguredName once at creation so the Home app shows a clear
+      // default label. Don't overwrite on subsequent loads — that would
+      // wipe out any rename the user has done themselves.
+      if (Characteristic.ConfiguredName) {
+        service.setCharacteristic(Characteristic.ConfiguredName, defaultName);
+      }
+    }
+    return service;
+  }
+
+  // ---- HomeKit camera controller -------------------------------------------
+
+  _setupCameraController() {
+    const { hap } = require("../types");
+    if (!hap?.CameraController) return; // unit-test environments
+
+    const delegate = new WyzeCameraStreamingDelegate(this);
+
+    const controller = new hap.CameraController({
+      cameraStreamCount: 2,
+      delegate,
+      streamingOptions: {
+        supportedCryptoSuites: [hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
+        video: {
+          resolutions: [
+            [1920, 1080, 30],
+            [1280, 720, 30],
+            [1280, 720, 15],
+            [640, 360, 30],
+            [640, 360, 15],
+            [320, 240, 15],
+          ],
+          codec: {
+            profiles: [hap.H264Profile.BASELINE, hap.H264Profile.MAIN],
+            levels: [hap.H264Level.LEVEL3_1, hap.H264Level.LEVEL4_0],
+          },
+        },
+        audio: {
+          twoWayAudio: false,
+          codecs: [
+            {
+              type: hap.AudioStreamingCodecType.OPUS,
+              samplerate: [
+                hap.AudioStreamingSamplerate.KHZ_16,
+                hap.AudioStreamingSamplerate.KHZ_24,
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    this.homeKitAccessory.configureController(controller);
+
     if (this.plugin.config.pluginLoggingEnabled)
       this.plugin.log(
-        `[Camera] [Garage Door] Getting Current State for ${this.mac} (${this.display_name} : ${this.garageDoor})`
+        `[Camera] [Stream] CameraController configured for ${this.display_name} (${this.mac})`
       );
-    let currentValue;
+  }
 
-    if (this.garageDoor == 1) {
-      currentValue = Characteristic.CurrentDoorState.OPEN;
-    } else currentValue = Characteristic.CurrentDoorState.CLOSED;
-    return currentValue;
+  // ---- Update cycle ---------------------------------------------------------
+
+  async updateCharacteristics(device) {
+    if (!this._cameraControllerReady) {
+      this._cameraControllerReady = true;
+      try {
+        this._setupCameraController();
+      } catch (err) {
+        this.plugin.log.error(
+          `[Camera] _setupCameraController failed for ${this.display_name}: ${err.message}\n${err.stack}`
+        );
+      }
+    }
+
+    try {
+      this.cameraOnline = this.plugin.client.cameraIsOnline(device);
+    } catch (err) {
+      this.plugin.log.error(
+        `[Camera] cameraIsOnline failed for ${this.display_name}: ${err.message}`
+      );
+      this.cameraOnline = false;
+    }
+
+    // StatusActive on every service so the user sees an "inactive" badge
+    // when the camera is offline (much friendlier than the noResponse
+    // banner — the last known state stays visible).
+    markServiceOnline(this.privacySwitch, this.cameraOnline);
+    markServiceOnline(this.sirenSwitch, this.cameraOnline);
+    markServiceOnline(this.floodLightService, this.cameraOnline);
+    markServiceOnline(this.spotLightService, this.cameraOnline);
+    markServiceOnline(this.garageDoorService, this.cameraOnline);
+    markServiceOnline(this.notificationSwitch, this.cameraOnline);
+    markServiceOnline(this.motionDetectionSwitch, this.cameraOnline);
+
+    if (!this.cameraOnline) {
+      if (this.plugin.config.pluginLoggingEnabled)
+        this.plugin.log(
+          `[Camera] ${this.mac} (${this.display_name}) is offline — keeping last known state, marked inactive`
+        );
+      return;
+    }
+
+    if (!this.cameraAccessoryAttached()) {
+      // Privacy-only path — no extra API call, just read the bulk-list field.
+      const powerSwitch = device.device_params?.power_switch;
+      this.power_switch = powerSwitch;
+      this.privacySwitch?.getCharacteristic(Characteristic.On).updateValue(powerSwitch);
+      this.persistState({ power_switch: powerSwitch });
+      if (this.plugin.config.pluginLoggingEnabled)
+        this.plugin.log(
+          `[Camera] ${this.mac} (${this.display_name}): privacy ${powerSwitch ? "on" : "off"}`
+        );
+      return;
+    }
+
+    // NOTE: one extra getDevicePID API call per refresh per camera that has
+    // any attached accessory configured (garage / spotlight / floodlight /
+    // siren / notification). Required because the bulk getObjectList
+    // doesn't include those PIDs.
+    let propertyList;
+    try {
+      propertyList = await this.plugin.client.getDevicePID(this.mac, this.product_model);
+    } catch (err) {
+      this.plugin.log.error(
+        `[Camera] getDevicePID failed for ${this.display_name}: ${err.message}`
+      );
+      markServiceOnline(this.privacySwitch, false);
+      return;
+    }
+    if (!propertyList?.data?.property_list) {
+      this.plugin.log.error(
+        `[Camera] getDevicePID returned unexpected data for ${this.display_name}`
+      );
+      return;
+    }
+
+    const summary = [];
+    for (const property of propertyList.data.property_list) {
+      switch (property.pid) {
+        case "P1": // Notification
+          if (this._isInConfig("notificationAccessory")) {
+            this.notification = property.value;
+            this.notificationSwitch?.getCharacteristic(Characteristic.On).updateValue(this.notification);
+            summary.push(`notifications=${this.notification ? "on" : "off"}`);
+          }
+          break;
+        case "P3": // Privacy
+          this.on = property.value;
+          this.privacySwitch?.getCharacteristic(Characteristic.On).updateValue(this.on);
+          summary.push(`privacy=${this.on ? "on" : "off"}`);
+          break;
+        case "P5": // Available
+          this.available = property.value;
+          break;
+        case "P1049": // Siren
+          if (this._isInConfig("sirenAccessory")) {
+            this.siren = property.value;
+            this.sirenSwitch?.getCharacteristic(Characteristic.On).updateValue(this.siren);
+            summary.push(`siren=${this.siren ? "on" : "off"}`);
+          }
+          break;
+        case "P1056": // Spotlight / Floodlight (same PID — covers both)
+          if (this._isInConfig("spotLightAccessory")) {
+            this.floodLight = property.value;
+            this.spotLightService?.getCharacteristic(Characteristic.On).updateValue(this.floodLight);
+            summary.push(`spotlight=${this.floodLight ? "on" : "off"}`);
+          }
+          break;
+        case "P1301": // Garage Door
+          if (this._isInConfig("garageDoorAccessory")) {
+            this.garageDoor = property.value;
+            summary.push(`garage=${property.value == 1 ? "open" : "closed"}`);
+          }
+          break;
+        case "P1001":   // Motion detection state (most cameras)
+        case "P1029": { // Motion detection state (Wyze Cam Outdoor)
+          if (this._isInConfig("motionDetectionAccessory")) {
+            // Wyze returns "1"/"0" strings on some firmwares, 1/0 ints
+            // on others. Coerce to boolean explicitly so the HomeKit
+            // characteristic gets a clean true/false.
+            this.motionDetection = property.value == 1 || property.value === "1";
+            this.motionDetectionSwitch
+              ?.getCharacteristic(Characteristic.On)
+              .updateValue(this.motionDetection);
+            summary.push(`motion=${this.motionDetection ? "on" : "off"}`);
+          }
+          break;
+        }
+      }
+    }
+
+    // Persist whatever fields we successfully read so the next reboot
+    // gets accurate values immediately instead of "undefined" until the
+    // first refresh.
+    this.persistState({
+      on: this.on,
+      notification: this.notification,
+      siren: this.siren,
+      floodLight: this.floodLight,
+      garageDoor: this.garageDoor,
+      motionDetection: this.motionDetection,
+    });
+
+    if (this.plugin.config.pluginLoggingEnabled && summary.length > 0)
+      this.plugin.log(
+        `[Camera] ${this.mac} (${this.display_name}): ${summary.join(", ")}`
+      );
+  }
+
+  // ---- Get handlers --------------------------------------------------------
+
+  async handleOnGetPrivacySwitch() {
+    // Pull from the right cached field depending on whether we have an
+    // attached accessory (PID-driven flow) or just the bulk list field.
+    const value = this.cameraAccessoryAttached() ? this.on : this.power_switch;
+    return value ?? 0;
+  }
+
+  async handleOnGetSpotlight()    { return this.floodLight ?? 0; }
+  async handleOnGetFloodlight()   { return this.floodLight ?? 0; }
+  async handleOnGetAlarmSwitch()  { return this.siren ?? 0; }
+  async getNotification()         { return this.notification ?? 0; }
+  async getMotionDetection()      { return this.motionDetection ?? 0; }
+
+  async getGarageCurrentState() {
+    return this.plugin.client.wyzeGarageDoorStateToHomeKit(this.garageDoor);
   }
 
   async getGarageTargetState() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Garage Door] Getting Target State for ${this.mac} (${this.display_name} : ${this.garageDoor})`
-      );
-
-    let currentValue;
-
-    if (this.garageDoor == 1) {
-      currentValue = Characteristic.TargetDoorState.OPEN;
-    } else currentValue = Characteristic.TargetDoorState.CLOSED;
-
-    return currentValue;
+    return this.plugin.client.wyzeGarageDoorStateToHomeKit(this.garageDoor);
   }
 
   async handleObstructionDetectedGet() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Garage Door] Getting ObstructionState for ${this.mac} (${this.display_name})`
-      );
-
     return 0;
   }
 
-  async handleOnGetPrivacySwitch() {
-    if (this.cameraAccessoryAttached()) {
-      this.powerSwitch = this.on;
-    } else this.powerSwitch = this.power_switch;
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Privacy] Getting Current State for ${this.mac} (${this.display_name} : ${this.powerSwitch})`
+  // ---- Set handlers --------------------------------------------------------
+
+  async handleOnSetPrivacySwitch(value) {
+    return this._set("Privacy", () => {
+      // Floodlight Pro uses Wyze DeviceMgmt power commands rather than
+      // the legacy camera privacy command path.
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraTurnOn(this.mac, this.product_model)
+          : this.plugin.client.cameraTurnOff(this.mac, this.product_model);
+      }
+
+      return this.plugin.client.cameraPrivacy(
+        this.mac,
+        this.product_model,
+        value ? "power_on" : "power_off"
       );
-    if (this.powerSwitch === "undefined" || this.powerSwitch == null) {
-      return 0;
-    } else {
-      return this.powerSwitch;
-    }
+    });
   }
 
-  async handleOnGetSpotlight() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Spotlight] Getting Current State for ${this.mac} (${this.display_name} : ${this.floodLight})`
-      );
-    if (this.floodLight === "undefined" || this.floodLight == null) {
-      return 0;
-    } else return this.floodLight;
-  }
+  async handleOnSetAlarmSwitch(value) {
+    return this._set("Siren", () => {
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraSirenOn(this.mac, this.product_model)
+          : this.plugin.client.cameraSirenOff(this.mac, this.product_model);
+      }
 
-  async handleOnGetFloodlight() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [FloodLight] Getting Current State for ${this.mac} (${this.display_name} : ${this.floodLight})`
+      return this.plugin.client.cameraSiren(
+        this.mac,
+        this.product_model,
+        value ? "siren_on" : "siren_off"
       );
-    if (this.floodLight === "undefined" || this.floodLight == null) {
-      return 0;
-    } else return this.floodLight;
-  }
-
-  async handleOnGetAlarmSwitch() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Siren] Getting Current State for ${this.mac} (${this.display_name} : ${this.siren})`
-      );
-    if (this.siren === "undefined" || this.siren == null) {
-      return 0;
-    } else return this.siren;
-  }
-
-  async getNotification() {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Notification] Getting Current State for ${this.mac} (${this.display_name} : ${this.notification})`
-      );
-    if (this.notification === "undefined" || this.notification == null) {
-      return 0;
-    } else return this.notification;
+    });
   }
 
   async handleOnSetSpotlight(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Spotlight] Setting Current State for ${this.mac} (${this.display_name}) to ${value}`
-      );
-    this.plugin.client.cameraSpotLight(
-      this.mac,
-      this.product_model,
-      value ? "1" : "2"
+    return this._set("Spotlight", () =>
+      this.plugin.client.cameraSpotLight(this.mac, this.product_model, value ? "1" : "2")
     );
   }
 
   async handleOnSetFloodlight(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [FloodLight] Setting Current State for ${this.mac} (${this.display_name}) to ${value}`
-      );
-    this.plugin.client.cameraFloodLight(
-      this.mac,
-      this.product_model,
-      value ? "1" : "2"
-    );
-  }
+    return this._set("Floodlight", () => {
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraFloodLightOn(this.mac, this.product_model)
+          : this.plugin.client.cameraFloodLightOff(this.mac, this.product_model);
+      }
 
-  async handleOnSetPrivacySwitch(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Privacy] Setting Current State for ${this.mac} (${this.display_name}) to ${value}`
+      return this.plugin.client.cameraFloodLight(
+        this.mac,
+        this.product_model,
+        value ? "1" : "2"
       );
-    this.plugin.client.cameraPrivacy(
-      this.mac,
-      this.product_model,
-      value ? "power_on" : "power_off"
-    );
-  }
-
-  async handleOnSetAlarmSwitch(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Siren] Setting Current State for ${this.mac} (${this.display_name}) to ${value}`
-      );
-    this.plugin.client.cameraSiren(
-      this.mac,
-      this.product_model,
-      value ? "siren_on" : "siren_off"
-    );
+    });
   }
 
   async setNotification(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Notification] Setting Current State for ${this.mac} (${this.display_name}) to ${value}`
-      );
-    this.plugin.client.cameraNotifications(
-      this.mac,
-      this.product_model,
-      value ? "1" : "0"
+    return this._set("Notification", () =>
+      this.plugin.client.cameraNotifications(this.mac, this.product_model, value ? "1" : "0")
+    );
+  }
+
+  async setMotionDetection(value) {
+    // cameraMotionOn / cameraMotionOff handle the per-model PID
+    // routing internally (P1001 + P1047 for most cameras, P1029 for
+    // Wyze Cam Outdoor). All we have to do here is pick the verb.
+    return this._set("Motion Detection", () =>
+      value
+        ? this.plugin.client.cameraMotionOn(this.mac, this.product_model)
+        : this.plugin.client.cameraMotionOff(this.mac, this.product_model)
     );
   }
 
   async setGarageTargetState(value) {
-    if (this.plugin.config.pluginLoggingEnabled)
-      this.plugin.log(
-        `[Camera] [Garage Door] Setting Target State for ${this.mac} (${this.display_name}) to ${value}`
-      );
-    this.plugin.client.garageDoor(this.mac, this.product_model);
+    await this._set("Garage Door", () =>
+      this.plugin.client.garageDoor(this.mac, this.product_model)
+    );
+    // Optimistically reflect the user's intent — actual door state will
+    // refresh on the next cycle's PID read.
     if (value == 0) {
       this.garageDoorService
         .getCharacteristic(Characteristic.CurrentDoorState)
@@ -514,13 +535,27 @@ module.exports = class WyzeCamera extends WyzeAccessory {
     }
   }
 
+  async _set(label, fn) {
+    if (this.plugin.config.pluginLoggingEnabled)
+      this.plugin.log(`[Camera] [${label}] Set "${this.display_name}"`);
+    try {
+      await fn();
+    } catch (err) {
+      this.plugin.log.error(
+        `[Camera] [${label}] Set failed for ${this.display_name}: ${err.message || err}`
+      );
+      throw err;
+    }
+  }
+
   cameraAccessoryAttached() {
-    return !!(
-      this.plugin.config.garageDoorAccessory?.find((d) => d === this.mac) ||
-      this.plugin.config.spotLightAccessory?.find((d) => d === this.mac) ||
-      this.plugin.config.sirenAccessory?.find((d) => d === this.mac) ||
-      this.plugin.config.floodLightAccessory?.find((d) => d === this.mac) ||
-      this.plugin.config.notificationAccessory?.find((d) => d === this.mac)
+    return (
+      this._isInConfig("garageDoorAccessory") ||
+      this._isInConfig("spotLightAccessory") ||
+      this._isInConfig("sirenAccessory") ||
+      this._isInConfig("floodLightAccessory") ||
+      this._isInConfig("notificationAccessory") ||
+      this._isInConfig("motionDetectionAccessory")
     );
   }
 };
