@@ -32,20 +32,22 @@ module.exports = class WyzeCamera extends WyzeAccessory {
 
     if (!Object.values(enums.CameraModels).includes(this.product_model)) return;
 
-    // Privacy switch — always added for cameras. Legacy fallback covers
-    // cameras that were paired before we started naming the service
-    // "<name> Privacy" (used to be just the camera name).
-    this.privacySwitch = this._getOrAddService({
-      ServiceType: Service.Switch,
-      subtype: "Privacy",
-      defaultName: `${this.display_name} Privacy`,
-      legacyLookup: () => this.homeKitAccessory.getService(this.display_name),
-      label: "Privacy Switch",
-    });
-    this.privacySwitch
-      .getCharacteristic(Characteristic.On)
-      .onGet(this.handleOnGetPrivacySwitch.bind(this))
-      .onSet(this.handleOnSetPrivacySwitch.bind(this));
+    // Floodlight Pro does not expose a reliable privacy/power control.
+    // Do not publish the nonfunctional Privacy switch for LD_CFP.
+    if (this.product_model !== "LD_CFP") {
+      this.privacySwitch = this._getOrAddService({
+        ServiceType: Service.Switch,
+        subtype: "Privacy",
+        defaultName: `${this.display_name} Privacy`,
+        legacyLookup: () => this.homeKitAccessory.getService(this.display_name),
+        label: "Privacy Switch",
+      });
+
+      this.privacySwitch
+        .getCharacteristic(Characteristic.On)
+        .onGet(this.handleOnGetPrivacySwitch.bind(this))
+        .onSet(this.handleOnSetPrivacySwitch.bind(this));
+    }
 
     if (!this.cameraAccessoryAttached()) return;
 
@@ -154,7 +156,43 @@ module.exports = class WyzeCamera extends WyzeAccessory {
   // ---- Helpers --------------------------------------------------------------
 
   _isInConfig(key) {
-    return Boolean(this.plugin.config[key]?.includes(this.mac));
+    const normalizeMac = (value) =>
+      String(value || "")
+        .replace(/^LD_CFP_/i, "")
+        .replace(/[^a-f0-9]/gi, "")
+        .toUpperCase();
+
+    const deviceMac = normalizeMac(this.mac);
+
+    // Legacy 1.x flat-array config.
+    if (
+      this.plugin.config[key]?.some(
+        (mac) => normalizeMac(mac) === deviceMac
+      )
+    ) {
+      return true;
+    }
+
+    // 2.x per-camera config.
+    const featureMap = {
+      garageDoorAccessory: "garage",
+      spotLightAccessory: "spotlight",
+      floodLightAccessory: "floodlight",
+      sirenAccessory: "siren",
+      notificationAccessory: "notifications",
+      motionDetectionAccessory: "motionDetection",
+    };
+
+    const feature = featureMap[key];
+    if (!feature || !Array.isArray(this.plugin.config.cameras)) {
+      return false;
+    }
+
+    const camera = this.plugin.config.cameras.find(
+      (c) => normalizeMac(c?.mac) === deviceMac
+    );
+
+    return camera?.[feature] === true;
   }
 
   _getOrAddService({ ServiceType, subtype, defaultName, legacyLookup, label }) {
@@ -408,15 +446,37 @@ module.exports = class WyzeCamera extends WyzeAccessory {
   // ---- Set handlers --------------------------------------------------------
 
   async handleOnSetPrivacySwitch(value) {
-    return this._set("Privacy", () =>
-      this.plugin.client.cameraPrivacy(this.mac, this.product_model, value ? "power_on" : "power_off")
-    );
+    return this._set("Privacy", () => {
+      // Floodlight Pro uses Wyze DeviceMgmt power commands rather than
+      // the legacy camera privacy command path.
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraTurnOn(this.mac, this.product_model)
+          : this.plugin.client.cameraTurnOff(this.mac, this.product_model);
+      }
+
+      return this.plugin.client.cameraPrivacy(
+        this.mac,
+        this.product_model,
+        value ? "power_on" : "power_off"
+      );
+    });
   }
 
   async handleOnSetAlarmSwitch(value) {
-    return this._set("Siren", () =>
-      this.plugin.client.cameraSiren(this.mac, this.product_model, value ? "siren_on" : "siren_off")
-    );
+    return this._set("Siren", () => {
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraSirenOn(this.mac, this.product_model)
+          : this.plugin.client.cameraSirenOff(this.mac, this.product_model);
+      }
+
+      return this.plugin.client.cameraSiren(
+        this.mac,
+        this.product_model,
+        value ? "siren_on" : "siren_off"
+      );
+    });
   }
 
   async handleOnSetSpotlight(value) {
@@ -426,9 +486,19 @@ module.exports = class WyzeCamera extends WyzeAccessory {
   }
 
   async handleOnSetFloodlight(value) {
-    return this._set("Floodlight", () =>
-      this.plugin.client.cameraFloodLight(this.mac, this.product_model, value ? "1" : "2")
-    );
+    return this._set("Floodlight", () => {
+      if (this.product_model === "LD_CFP") {
+        return value
+          ? this.plugin.client.cameraFloodLightOn(this.mac, this.product_model)
+          : this.plugin.client.cameraFloodLightOff(this.mac, this.product_model);
+      }
+
+      return this.plugin.client.cameraFloodLight(
+        this.mac,
+        this.product_model,
+        value ? "1" : "2"
+      );
+    });
   }
 
   async setNotification(value) {

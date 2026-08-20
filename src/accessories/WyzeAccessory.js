@@ -1,5 +1,4 @@
 const { Service, Characteristic } = require("../types");
-const { ModelNames } = require("../enums");
 
 // Responses from the Wyze API can lag a little after a new value is set
 const UPDATE_THROTTLE_MS = 1000;
@@ -8,7 +7,6 @@ module.exports = class WyzeAccessory {
   constructor(plugin, homeKitAccessory) {
     this.updating = false;
     this.lastTimestamp = null;
-    this.lastDevice = null;
 
     this.plugin = plugin;
     this.homeKitAccessory = homeKitAccessory;
@@ -26,9 +24,6 @@ module.exports = class WyzeAccessory {
   }
   get product_model() {
     return this.homeKitAccessory.context.product_model;
-  }
-  get model_name() {
-    return ModelNames[this.product_model] || this.product_model;
   }
 
   /** Determines whether this accessory matches the given Wyze device */
@@ -65,26 +60,12 @@ module.exports = class WyzeAccessory {
         device.firmware_ver
       );
 
-    this.lastDevice = device;
     if (this.shouldUpdateCharacteristics(timestamp)) {
-      this.lastTimestamp = timestamp;
-      this.updating = true;
-      try {
-        // Promise.resolve wraps both sync-return and async-return uniformly.
-        // The outer try/catch is required: if updateCharacteristics() throws
-        // synchronously, the throw escapes Promise.resolve() before .catch()
-        // is attached, which would turn update() into an unhandled rejection.
-        Promise.resolve(this.updateCharacteristics(device))
-          .catch(e => {
-            if (this.plugin?.log?.error)
-              this.plugin.log.error(`[${this.product_type}] Error updating "${this.display_name}": ${e}`);
-          })
-          .finally(() => { this.updating = false; });
-      } catch (e) {
-        this.updating = false;
-        if (this.plugin?.log?.error)
-          this.plugin.log.error(`[${this.product_type}] Error updating "${this.display_name}": ${e}`);
-      }
+      Promise.resolve(this.updateCharacteristics(device)).catch((err) => {
+        this.plugin.log.error(
+          `[${device.product_type}] Error updating ${device.nickname}: ${err.message}\n${err.stack}`
+        );
+      });
     }
   }
   shouldUpdateCharacteristics(timestamp) {
@@ -138,35 +119,20 @@ module.exports = class WyzeAccessory {
 
     this.homeKitAccessory.context.lastState = { ...prev, ...state };
 
-    // Flush. Only valid for bridged accessories — externals (cameras)
-    // are persisted differently, so we no-op on those without erroring.
+    // External accessories such as cameras are not associated with the
+    // platform cache and must never be passed to updatePlatformAccessories.
+    if (this.homeKitAccessory.context?.external) {
+      return;
+    }
+
     try {
       this.plugin.api.updatePlatformAccessories?.([this.homeKitAccessory]);
     } catch (_) {
-      // Likely an external accessory or homebridge variant that doesn't
-      // expose updatePlatformAccessories. Context mutation is in memory
-      // and will still be saved on clean shutdown.
+      // Homebridge variant that does not expose updatePlatformAccessories.
     }
   }
 
   sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  // Optimistic-update grace period: after firing a command, arm this for the
-  // command's expected propagation time so a poll landing before the Wyze API
-  // catches up doesn't revert the optimistic HomeKit state back to stale data.
-  armCommandGrace(ms) {
-    this._commandGraceUntil = Date.now() + ms;
-  }
-
-  // Call when a command is known to have failed so the next poll (rather than
-  // the full grace window) is free to correct the optimistic state.
-  clearCommandGrace() {
-    this._commandGraceUntil = 0;
-  }
-
-  inCommandGrace() {
-    return Date.now() <= (this._commandGraceUntil || 0);
+    return new Promise((resolve) => setTimeout(resolve, ms * 1000));
   }
 };
