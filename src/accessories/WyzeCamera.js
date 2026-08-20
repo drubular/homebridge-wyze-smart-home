@@ -1,4 +1,4 @@
-const { Service, Characteristic } = require("../types");
+const { Service, Characteristic, Accessory, UUIDGen } = require("../types");
 const WyzeAccessory = require("./WyzeAccessory");
 const enums = require("../enums");
 const WyzeCameraStreamingDelegate = require("../camera/WyzeCameraStreamingDelegate");
@@ -102,17 +102,50 @@ module.exports = class WyzeCamera extends WyzeAccessory {
 
     if (this._isInConfig("sirenAccessory")) {
       this.sirenEnabled = true;
-      this.sirenSwitch = this._getOrAddService({
-        ServiceType: Service.Switch,
-        subtype: "Siren",
-        defaultName: `${this.display_name} Siren`,
-        legacyLookup: () => this.homeKitAccessory.getService(`${this.display_name} Siren`),
-        label: "Siren",
-      });
-      this.sirenSwitch
-        .getCharacteristic(Characteristic.On)
-        .onGet(this.handleOnGetAlarmSwitch.bind(this))
-        .onSet(this.handleOnSetAlarmSwitch.bind(this));
+
+      if (this.product_model === "LD_CFP") {
+        // Floodlight Pro: publish siren as its own external HomeKit accessory.
+        // This prevents Siri from treating Floodlight + Siren as one grouped
+        // camera accessory when controlling the floodlight.
+        const sirenName = `${this.display_name.replace(/\\s*Camera$/i, "")} Siren`;
+        const sirenUuid = UUIDGen.generate(`${this.mac}:siren`);
+
+        this.sirenHomeKitAccessory = new Accessory(sirenName, sirenUuid);
+        this.sirenHomeKitAccessory.context = {
+          mac: this.mac,
+          product_type: "CameraSiren",
+          product_model: this.product_model,
+          nickname: sirenName,
+          external: true,
+        };
+
+        this.sirenSwitch =
+          this.sirenHomeKitAccessory.getService(Service.Switch) ||
+          this.sirenHomeKitAccessory.addService(Service.Switch, sirenName, "Siren");
+
+        this.sirenSwitch
+          .getCharacteristic(Characteristic.On)
+          .onGet(this.handleOnGetAlarmSwitch.bind(this))
+          .onSet(this.handleOnSetAlarmSwitch.bind(this));
+
+        this.plugin.api.publishExternalAccessories(
+          "homebridge-wyze-smart-home",
+          [this.sirenHomeKitAccessory]
+        );
+      } else {
+        this.sirenSwitch = this._getOrAddService({
+          ServiceType: Service.Switch,
+          subtype: "Siren",
+          defaultName: `${this.display_name} Siren`,
+          legacyLookup: () => this.homeKitAccessory.getService(`${this.display_name} Siren`),
+          label: "Siren",
+        });
+
+        this.sirenSwitch
+          .getCharacteristic(Characteristic.On)
+          .onGet(this.handleOnGetAlarmSwitch.bind(this))
+          .onSet(this.handleOnSetAlarmSwitch.bind(this));
+      }
     }
 
     if (this._isInConfig("notificationAccessory")) {
