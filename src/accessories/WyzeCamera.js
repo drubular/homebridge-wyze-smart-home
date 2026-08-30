@@ -401,11 +401,23 @@ module.exports = class WyzeCamera extends WyzeAccessory {
             summary.push(`siren=${this.siren ? "on" : "off"}`);
           }
           break;
-        case "P1056": // Spotlight / Floodlight (same PID — covers both)
-          if (this._isInConfig("spotLightAccessory")) {
-            this.floodLight = property.value;
-            this.spotLightService?.getCharacteristic(Characteristic.On).updateValue(this.floodLight);
-            summary.push(`spotlight=${this.floodLight ? "on" : "off"}`);
+        case "P1056": // Spotlight / Floodlight shared state
+          if (
+            this._isInConfig("spotLightAccessory") ||
+            this._isInConfig("floodLightAccessory")
+          ) {
+            this.floodLight =
+              property.value == 1 || property.value === "1" || property.value === true;
+
+            this.spotLightService
+              ?.getCharacteristic(Characteristic.On)
+              .updateValue(this.floodLight);
+
+            this.floodLightService
+              ?.getCharacteristic(Characteristic.On)
+              .updateValue(this.floodLight);
+
+            summary.push(`light=${this.floodLight ? "on" : "off"}`);
           }
           break;
         case "P1301": // Garage Door
